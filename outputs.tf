@@ -1,17 +1,4 @@
-output "cluster_name" {
-  description = "GKE Cluster name"
-  value       = module.gke.name
-}
 
-output "cluster_endpoint" {
-  description = "GKE Cluster public IP"
-  value       = module.gke.endpoint
-  sensitive   = true
-}
-
-output "kube_config" {
-  value = module.kubeconfig.kube_config
-}
 
 output "postgres_fqdn" {
   description = "Private IP of the PostgreSQL server. Use this value to set DATABASE_HOST in your Viya deployment."

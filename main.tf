@@ -8,12 +8,6 @@ provider "google-beta" {
   project     = var.project
 }
 
-provider "kubernetes" {
-  host                   = "https://${module.gke.endpoint}"
-  cluster_ca_certificate = base64decode(module.gke.ca_certificate)
-  token                  = data.google_client_config.current.access_token
-  load_config_file       = false
-}
 
 data "google_client_config" "current" {}
 
@@ -107,25 +101,6 @@ data "external" "iac_tooling_version" {
   program = ["files/tools/iac_tooling_version.sh"]
 }
 
-resource "kubernetes_config_map" "sas_iac_buildinfo" {
-  metadata {
-    name      = "sas-iac-buildinfo"
-    namespace = "kube-system"
-  }
-
-  data = {
-    git-hash    = lookup(data.external.git_hash.result, "git-hash")
-    iac-tooling = var.iac_tooling
-    terraform   = <<EOT
-version: ${lookup(data.external.iac_tooling_version.result, "terraform_version")}
-revision: ${lookup(data.external.iac_tooling_version.result, "terraform_revision")}
-provider-selections: ${lookup(data.external.iac_tooling_version.result, "provider_selections")}
-outdated: ${lookup(data.external.iac_tooling_version.result, "terraform_outdated")}
-EOT
-  }
-
-  depends_on = [ module.gke ]
-}
 
 resource "google_filestore_instance" "rwx" {
   name   = "${var.prefix}-rwx-filestore"
@@ -151,117 +126,7 @@ data "google_container_engine_versions" "gke-version" {
   version_prefix = "${var.kubernetes_version}."
 }
 
-module "gke" {
-  source                        = "terraform-google-modules/kubernetes-engine/google//modules/private-cluster"
-  version                       = "14.3.0"
-  project_id                    = var.project
-  name                          = "${var.prefix}-gke"
-  region                        = local.region
-  regional                      = var.regional
-  zones                         = [local.zone]
-  network                       = module.vpc.network_name
-  subnetwork                    = local.subnet_names["gke"]
-  ip_range_pods                 = local.subnet_names["gke_pods_range_name"]
-  ip_range_services             = local.subnet_names["gke_services_range_name"]
-  http_load_balancing           = false
-  horizontal_pod_autoscaling    = true
-  deploy_using_private_endpoint = var.private_cluster
-  enable_private_endpoint       = var.private_cluster
-  enable_private_nodes          = true
-  master_ipv4_cidr_block        = var.gke_control_plane_subnet_cidr
-  
-  node_pools_metadata           = {"all": var.tags}
-  cluster_resource_labels       = var.tags
 
-  add_cluster_firewall_rules    = true
-
-  release_channel               = var.kubernetes_channel != "UNSPECIFIED" ? var.kubernetes_channel : null
-  kubernetes_version            = var.kubernetes_channel == "UNSPECIFIED" ? var.kubernetes_version : data.google_container_engine_versions.gke-version.release_channel_default_version[var.kubernetes_channel]
-
-  network_policy                = var.gke_network_policy
-  remove_default_node_pool	    = true
-
-  grant_registry_access         = var.create_container_registry
-
-  monitoring_service            = var.create_gke_monitoring_service ? var.gke_monitoring_service : "none"
-
-  cluster_autoscaling           = var.enable_cluster_autoscaling ? { "enabled": true, "max_cpu_cores": var.cluster_autoscaling_max_cpu_cores, "max_memory_gb": var.cluster_autoscaling_max_memory_gb, "min_cpu_cores": 1, "min_memory_gb": 1 } : { "enabled": false, "max_cpu_cores": 0, "max_memory_gb": 0, "min_cpu_cores": 0, "min_memory_gb": 0}
-
-  master_authorized_networks    = concat([
-    for cidr in (var.cluster_endpoint_public_access_cidrs == null ? local.default_public_access_cidrs : var.cluster_endpoint_public_access_cidrs): {
-      display_name = cidr
-      cidr_block   = cidr
-    }], [{
-      display_name = "VPC"
-      cidr_block   = module.vpc.subnets["gke"].ip_cidr_range
-  }])
-
-  node_pools = [
-    for nodepool, settings in local.node_pools: {
-      name               = nodepool
-      machine_type       = settings.vm_type
-      node_locations     = local.zone # This must be a zone not a region. So var.location may not always work. ;)
-      min_count          = settings.min_nodes
-      max_count          = settings.max_nodes
-      node_count         = (settings.min_nodes == settings.max_nodes) ? settings.min_nodes : null
-      autoscaling        = (settings.min_nodes == settings.max_nodes) ? false : true
-      local_ssd_count    = settings.local_ssd_count
-      disk_size_gb       = settings.os_disk_size
-      auto_repair        = (var.kubernetes_channel == "UNSPECIFIED") ? false : true
-      auto_upgrade       = (var.kubernetes_channel == "UNSPECIFIED") ? false : true
-      preemptible        = false
-      disk_type          = "pd-standard"
-      image_type         = "COS"
-      accelerator_count  = settings.accelerator_count
-      accelerator_type   = settings.accelerator_type
-    }
-  ]
-
-  node_pools_oauth_scopes = {
-    all = [   
-      "https://www.googleapis.com/auth/logging.write",
-      "https://www.googleapis.com/auth/monitoring",
-      "https://www.googleapis.com/auth/devstorage.read_only",
-      "https://www.googleapis.com/auth/servicecontrol",
-      "https://www.googleapis.com/auth/service.management.readonly",
-      "https://www.googleapis.com/auth/trace.append",
-    ]
-
-    default-node-pool = [
-      "https://www.googleapis.com/auth/cloud-platform",
-    ]
-  }
-
-  node_pools_labels = {
-    for nodepool, settings in local.node_pools: nodepool => settings.node_labels
-  }
-
-  node_pools_taints = {
-    for nodepool, settings in local.node_pools: nodepool => [
-      for taint in settings.node_taints: {
-        key = split("=", split(":", taint)[0])[0]
-        value  = split("=", split(":", taint)[0])[1]
-        effect = local.taint_effects[split(":", taint)[1]]
-      }
-    ]
-  }
-
-  depends_on = [module.vpc]
-}
-
-module "kubeconfig" {
-  source                   = "./modules/kubeconfig"
-  prefix                   = var.prefix
-  create_static_kubeconfig = var.create_static_kubeconfig
-  path                     = local.kubeconfig_path
-  namespace                = "kube-system"
-
-  cluster_name             = module.gke.name
-  endpoint                 = "https://${module.gke.endpoint}"
-  ca_crt                   = module.gke.ca_certificate
-
-  depends_on = [ module.gke ]
-}
 
 module "postgresql" {
   source                           = "GoogleCloudPlatform/sql-db/google//modules/postgresql"
